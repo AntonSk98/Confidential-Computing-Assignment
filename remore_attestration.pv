@@ -1,0 +1,93 @@
+(* Intel Sgx remote attestation *)
+
+type attestation_private_key.
+type attestation_public_key.
+
+(* define even which will be triggered in case of successful remote attestation *)
+event successful_attestation.
+query event (successful_attestation).
+
+free c: channel.
+
+(* variable declaration for temporary report *)
+free SGX_APPLICATION_MRENCLAVE: bitstring.
+free KEY_ID: bitstring.
+free USER_DATA: bitstring.
+free CPUSVN: bitstring.
+
+(* variable declaration for derive_key function *)
+free REPORT_KEY: bitstring [private].
+free CR_OWNEREPOCH: bitstring [private].
+free CR_SEAL_FUSES: bitstring [private].
+free INTEL_QUOTING_MRENCLAVE: bitstring.
+
+fun derive_key(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring): bitstring.
+fun cmac(bitstring, bitstring): bitstring.
+fun sign(bitstring, attestation_private_key): bitstring.
+fun derive_pk(attestation_private_key): attestation_public_key.
+reduc forall report: bitstring, key: attestation_private_key; checksign(sign(report, key), derive_pk(key), report) = true.
+
+query(attacker(derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, INTEL_QUOTING_MRENCLAVE))).
+
+let Remote_Challenger() =
+    (* entry point of program *)
+    new nonce: bitstring;
+    (* 1) send challenge to SGX_Application *)
+    out(c, nonce);
+    in(c, (QUOTE: bitstring, CMAC:bitstring));
+    out(c, (QUOTE, CMAC));
+    (* FINAL: get result from IAS and if the signature is verified then trigger the event *)
+    in(c, correct_signature:bool);
+    if correct_signature = true then event successful_attestation;
+    0.
+
+let SGX_Application() =
+    in(c, nonce:bitstring);
+    (* 2) send challenge to SGX_Application_Enclave for local attestation *)
+    out(c, INTEL_QUOTING_MRENCLAVE);
+    (* 4) forwards report to Intel_Quoting_Enclave *)
+    in(c, (CPUSVN_AE:bitstring, ENTITY_AE_MRENCLAVE_A:bitstring, USER_DATA_AE:bitstring, KEY_ID_AE:bitstring, MAC_AE:bitstring));
+    out(c, (CPUSVN_AE, ENTITY_AE_MRENCLAVE_A, USER_DATA_AE, KEY_ID_AE, MAC_AE));
+    (* 6) get QUOTE and CMAC and forward to IAS for verification *)
+    in(c, (QUOTE: bitstring, CMAC: bitstring));
+    out(c, (QUOTE, CMAC));
+    0.
+
+let SGX_Application_Enclave(CPUSVN: bitstring, USER_DATA: bitstring, KEY_ID: bitstring) =
+    (* get challenge from SGX_Application and create report *)
+    in(c, QE: bitstring);
+    (* create report body *)
+    let REPORT_BODY = (CPUSVN, SGX_APPLICATION_MRENCLAVE, USER_DATA) in
+    (* create temporary report consisting of report body and key id. NOTE: to get a full report we still need to compute MAC*)
+    let TEMP_REPORT = (REPORT_BODY, KEY_ID) in
+    (* start derive key function process *)
+    let TMP_REPORTKEY = derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, QE) in
+    (* to derive MAC we need TMP_REPORTKEY and REPORT_BODY *)
+    let MAC = cmac(TMP_REPORTKEY, REPORT_BODY) in
+    let REPORT = (TEMP_REPORT, MAC) in
+    (* 3) send report back to SGX_Application *)
+    out(c, REPORT);
+    0.
+
+let Intel_Quoting_Enclave(private_key: attestation_private_key) =
+    (* verify report and sign with EPID private key *)
+    in(c, (CPUSVN_AE:bitstring, ENTITY_AE_MRENCLAVE_A:bitstring, USER_DATA_AE:bitstring, KEY_ID_AE:bitstring, MAC_AE:bitstring));
+    let REPORT_BODY_AE = (CPUSVN_AE, ENTITY_AE_MRENCLAVE_A, USER_DATA_AE) in
+    let REPORT = (REPORT_BODY_AE, KEY_ID_AE, MAC_AE) in
+    let TMP_OUTPUTKEY = derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, INTEL_QUOTING_MRENCLAVE) in
+    let CMAC = cmac(TMP_OUTPUTKEY, REPORT_BODY_AE) in
+    (* check mac, sign and 5) send quote alongside CMAC to SGX_Application *)
+    if MAC_AE=CMAC then let QUOTE = sign(CMAC, private_key) in out(c, (QUOTE, CMAC));
+    0.
+
+let Intel_Attestation_Service(public_key: attestation_public_key) =
+    (* 7) get QUOTE and CMAC, check signature and send the result back to Remote_Challenger *)
+    in(c, (QUOTE:bitstring, CMAC:bitstring));
+    let correct_signature = checksign(QUOTE, public_key, CMAC) in
+    out(c, correct_signature);
+    0.
+
+process
+    new private_key: attestation_private_key;
+    let public_key = derive_pk(private_key) in out(c, public_key);
+    ((!Remote_Challenger()) | (!SGX_Application()) | (!SGX_Application_Enclave(CPUSVN, USER_DATA, KEY_ID)) | (!Intel_Quoting_Enclave(private_key)) | (!Intel_Attestation_Service(public_key)))

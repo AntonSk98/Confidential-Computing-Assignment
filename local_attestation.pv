@@ -1,0 +1,67 @@
+(* Intel Sgx local attestation *)
+
+free c: channel.
+
+(* variable declaration for temporary report *)
+free ENTITY_A_MRENCLAVE: bitstring.
+free KEY_ID: bitstring.
+free USER_DATA: bitstring.
+free CPUSVN: bitstring.
+
+(* variable declaration for the derive_key function *)
+(*
+    it is assumed that private fields used for key
+    derivation are not exposed to the public channel
+    and therefore not known to the attacker
+*)
+free REPORT_KEY: bitstring [private].
+free CR_OWNEREPOCH: bitstring [private].
+free CR_SEAL_FUSES: bitstring [private].
+free ENTITY_B_MRENCLAVE: bitstring.
+
+(* define event that will be triggered if enclave B will manage to verify the report from enclave A *)
+event verified_report.
+query event (verified_report).
+
+(* constructor to derive key *)
+fun derive_key(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring): bitstring.
+(* constructor to compute mac *)
+fun cmac(bitstring, bitstring): bitstring.
+
+(* check if an attacker is able to derive a key *)
+query(attacker(derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, ENTITY_B_MRENCLAVE))).
+
+let enclave_A(CPUSVN: bitstring, USER_DATA: bitstring, KEY_ID: bitstring) =
+    (* --awaits enclave_B entity-- *)
+    in(c, IDENTITY_B: bitstring);
+    (* create report body *)
+    let REPORT_BODY = (CPUSVN, ENTITY_A_MRENCLAVE, USER_DATA) in
+    (* create temporary report consisting of report body and key id. NOTE: to get a full report we still need to compute MAC*)
+    let TEMP_REPORT = (REPORT_BODY, KEY_ID) in
+    (* start derive key function process *)
+    let TMP_REPORTKEY = derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, IDENTITY_B) in
+    (* to derive MAC we need TMP_REPORTKEY and REPORT_BODY *)
+    let MAC = cmac(TMP_REPORTKEY, REPORT_BODY) in
+    (* append MAC and generate the report *)
+    let REPORT = (TEMP_REPORT, MAC) in
+    (* sends report to enclave_B *)
+    out(c, REPORT);
+    0.
+
+let enclave_B(CPUSVN: bitstring, KEY_ID: bitstring) =
+    (* entry point *)
+    let IDENTITY_B = ENTITY_B_MRENCLAVE in
+    out(c, IDENTITY_B);
+    (* --awaits report-- *)
+    in(c, (CPUSVN_A:bitstring, ENTITY_A_MRENCLAVE_A:bitstring, USER_DATA_A:bitstring, KEY_ID_A:bitstring, MAC_A:bitstring));
+    (* reconstruct report body of enclave_A *)
+    let REPORT_BODY_A = (CPUSVN_A, ENTITY_A_MRENCLAVE_A, USER_DATA_A) in
+    (* derive key *)
+    let TMP_OUTPUTKEY = derive_key(CPUSVN, REPORT_KEY, CR_OWNEREPOCH, CR_SEAL_FUSES, KEY_ID, IDENTITY_B) in
+    (* compute message authentication code *)
+    let MAC_OUTPUT = cmac(TMP_OUTPUTKEY, REPORT_BODY_A) in
+    (* check if MACs are equal *)
+    if MAC_A=MAC_OUTPUT then event verified_report;
+    0.
+process
+    ((!enclave_A(CPUSVN, USER_DATA, KEY_ID)) | (!enclave_B(CPUSVN, KEY_ID)))
